@@ -1,5 +1,5 @@
 # Core ML/transformer stack
-torch>=2.1.0
+# torch>=2.1.0
 transformers>=4.44.0
 accelerate>=0.30.0
 
@@ -14,7 +14,7 @@ sentencepiece>=0.2.0
 wandb>=0.22.3
 
 # Utilities
-numpy>=1.25.0
-pandas>=2.2.0
-scikit-learn>=1.4.0
-tqdm>=4.66.0
+numpy==1.24.0
+pandas==1.5.3
+scikit-learn>=1.5.0
+tqdm>=4.66.3

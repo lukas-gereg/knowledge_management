@@ -18,10 +18,6 @@ from transformers import (
     GenerationConfig,
 )
 
-# -----------------------------
-# Fixed config (as requested)
-# -----------------------------
-
 MAX_SOURCE_LEN  = 1024
 MAX_TARGET_LEN  = 128
 
