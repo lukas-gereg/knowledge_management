@@ -1,0 +1,20 @@
+# Core ML/transformer stack
+torch>=2.1.0
+transformers>=4.44.0
+accelerate>=0.30.0
+
+# Datasets and evaluation
+datasets>=2.19.0
+evaluate>=0.4.1
+sacrebleu>=2.4.0
+rouge-score>=0.1.2
+sentencepiece>=0.2.0
+
+# Optional logging and experiment tracking
+wandb>=0.22.3
+
+# Utilities
+numpy>=1.25.0
+pandas>=2.2.0
+scikit-learn>=1.4.0
+tqdm>=4.66.0
