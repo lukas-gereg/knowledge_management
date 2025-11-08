@@ -27,13 +27,13 @@ MAX_TARGET_LEN  = 128
 # -----------------------------
 def preprocess_fn(tokenizer, src_col: str, tgt_col: str):
     def _pp(batch):
-        # BART does not need a task prefix
         src = batch[src_col]
         tgt = batch[tgt_col]
         model_inputs = tokenizer(src, max_length=MAX_SOURCE_LEN, truncation=True)
         with tokenizer.as_target_tokenizer():
             labels = tokenizer(tgt, max_length=MAX_TARGET_LEN, truncation=True)
         model_inputs["labels"] = labels["input_ids"]
+        model_inputs["id"] = batch["id"]            # <— keep pointer to raw rows
         return model_inputs
     return _pp
 
@@ -53,11 +53,11 @@ class SumTrainer(Seq2SeqTrainer):
             preds = preds[0]
 
         # Replace -100 (ignore index) for decoding labels
-        preds[preds == -100] = self.processing_class.pad_token_id
-        labels[labels == -100] = self.processing_class.pad_token_id
+        preds[preds == -100] = self.tokenizer.pad_token_id
+        labels[labels == -100] = self.tokenizer.pad_token_id
 
-        dec_preds  = self.processing_class.batch_decode(preds,  skip_special_tokens=True)
-        dec_labels = self.processing_class.batch_decode(labels, skip_special_tokens=True)
+        dec_preds  = self.tokenizer.batch_decode(preds,  skip_special_tokens=True)
+        dec_labels = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
 
         dec_preds  = [p.strip() for p in dec_preds]
         dec_labels = [l.strip() for l in dec_labels]
@@ -112,29 +112,37 @@ def main():
     ds = load_dataset("cnn_dailymail", "3.0.0")
     ds = ds.map(lambda ex, idx: {"id": idx}, with_indices=True)
 
+    use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-    model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+    model = AutoModelForSeq2SeqLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.bfloat16 if use_bf16 else (torch.float16 if torch.cuda.is_available() else None),
+        attn_implementation="sdpa"
+    )
+
+    model.config.use_cache = True
 
     gen_config = GenerationConfig.from_model_config(model.config)
     gen_config.num_beams = 4
     gen_config.length_penalty = 2.0  # <- lives here now
     gen_config.max_new_tokens = MAX_TARGET_LEN
+    gen_config.early_stopping = True
 
     pp = preprocess_fn(tokenizer, src_col, tgt_col)
-    remove_cols = [c for c in ds["train"].column_names if c not in {src_col, tgt_col, "id"}]
-
+    remove_cols = [c for c in ds["train"].column_names if c != "id"]
     tokenized = ds.map(pp, batched=True, remove_columns=remove_cols)
 
-    collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model)
+    collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, pad_to_multiple_of=8)
 
     args = Seq2SeqTrainingArguments(
         output_dir="checkpoints_bart_cnn",
         eval_strategy="epoch",     # uses validation split
         save_strategy="epoch",
         learning_rate=2e-5,
-        num_train_epochs=100,
-        per_device_train_batch_size=4,
-        per_device_eval_batch_size=4,
+        num_train_epochs=50,
+        per_device_train_batch_size=16,
+        per_device_eval_batch_size=32,
         gradient_accumulation_steps=1,
         weight_decay=0.01,
         predict_with_generate=True,
@@ -142,17 +150,21 @@ def main():
         metric_for_best_model="eval_loss",
         greater_is_better=False,
         save_total_limit=2,
-        remove_unused_columns=False,
-        fp16=torch.cuda.is_available(),
+        remove_unused_columns=True,
         report_to="wandb",
+        use_cpu=False,
+        generation_config=gen_config,
+        dataloader_num_workers=4,
+        fp16=not use_bf16 and torch.cuda.is_available(),
+        bf16=use_bf16,
     )
 
     if wandb_login_key is not None and wandb.run is None:
         wandb.login(key=wandb_login_key)
 
         wandb.init(
-            project="PMAD",
-            entity="MZ",
+            project="MZ",
+            entity="DP_Gereg",
             config=args.to_dict(),
         )
 
@@ -163,15 +175,14 @@ def main():
         args=args,
         train_dataset=tokenized["train"],
         eval_dataset=tokenized["validation"],  # explicit validation split
-        processing_class=tokenizer,
+        tokenizer=tokenizer,
         data_collator=collator,
-        generation_config=gen_config,
     )
 
     # Keep the eval callback (train-split metrics + sample logs)
     trainer.add_callback(TrainEvalCallback(trainer))
 
-    trainer.add_callback(EarlyStoppingCallback(early_stopping_patience=10))
+    trainer.add_callback(EarlyStoppingCallback(early_stopping_patience=5))
 
     print("Training…")
     trainer.train()
