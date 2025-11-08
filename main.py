@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import evaluate
 import wandb
@@ -37,7 +38,6 @@ def preprocess_fn(tokenizer, src_col: str, tgt_col: str):
         return model_inputs
     return _pp
 
-
 # -----------------------------
 # Custom Trainer (ROUGE + BLEU)
 # -----------------------------
@@ -47,7 +47,7 @@ class SumTrainer(Seq2SeqTrainer):
         self.bleu_metric  = evaluate.load("bleu")
         self.rouge_metric = evaluate.load("rouge")
 
-    def compute_metrics(self, eval_preds):
+    def compute_metrics_full(self, eval_preds):
         preds, labels = eval_preds
         if isinstance(preds, tuple):
             preds = preds[0]
@@ -86,14 +86,39 @@ class SumTrainer(Seq2SeqTrainer):
 # Eval callback: also eval on train and log samples
 # -----------------------------
 class TrainEvalCallback(TrainerCallback):
-    def __init__(self, trainer: Seq2SeqTrainer):
+    def __init__(self, trainer: SumTrainer, training_sample_size, eval_sample_size, seed):
         self.trainer = trainer
+        self.training_sample_size = training_sample_size
+        self.eval_sample_size = eval_sample_size
+
+        self.rng_generator = np.random.default_rng(seed)
+        self.running = False
 
     def on_evaluate(self, args, state: TrainerState, control: TrainerControl, metrics=None, **kwargs):
-        if metrics and any(k.startswith("eval") for k in metrics):
-            train_metrics = self.trainer.evaluate(eval_dataset=self.trainer.train_dataset, metric_key_prefix="train")
+        if not self.running and metrics and any(k.startswith("eval") for k in metrics):
+            old_flag = self.trainer.args.predict_with_generate
+            old_compute_metrics = self.trainer.compute_metrics
 
-            self.trainer.log(train_metrics)
+            try:
+                self.running = True
+                self.trainer.args.predict_with_generate = True
+                self.trainer.compute_metrics = self.trainer.compute_metrics_full
+
+                train_dataset_length = len(self.trainer.train_dataset)
+                train_indices = self.rng_generator.choice(train_dataset_length, size=min(self.training_sample_size, train_dataset_length), replace=False)
+                train_metrics = self.trainer.evaluate(eval_dataset=self.trainer.train_dataset.select(train_indices.tolist()), metric_key_prefix="train")
+
+                self.trainer.log(train_metrics)
+
+                eval_dataset_length = len(self.trainer.eval_dataset)
+                eval_indices = self.rng_generator.choice(eval_dataset_length, size=min(self.eval_sample_size, eval_dataset_length), replace=False)
+                eval_metrics = self.trainer.evaluate(eval_dataset=self.trainer.eval_dataset.select(eval_indices.tolist()))
+
+                self.trainer.log(eval_metrics)
+            finally:
+                self.running = False
+                self.trainer.args.predict_with_generate = old_flag
+                self.trainer.compute_metrics = old_compute_metrics
 
         return control
 
@@ -107,7 +132,8 @@ def main():
     src_col = "article"
     tgt_col = "highlights"
 
-    set_seed(42)
+    seed = 42
+    set_seed(seed)
 
     ds = load_dataset("cnn_dailymail", "3.0.0")
     ds = ds.map(lambda ex, idx: {"id": idx}, with_indices=True)
@@ -145,7 +171,7 @@ def main():
         per_device_eval_batch_size=32,
         gradient_accumulation_steps=1,
         weight_decay=0.01,
-        predict_with_generate=True,
+        predict_with_generate=False,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
@@ -180,7 +206,7 @@ def main():
     )
 
     # Keep the eval callback (train-split metrics + sample logs)
-    trainer.add_callback(TrainEvalCallback(trainer))
+    trainer.add_callback(TrainEvalCallback(trainer, training_sample_size=256, eval_sample_size=256, seed=seed))
 
     trainer.add_callback(EarlyStoppingCallback(early_stopping_patience=5))
 
@@ -188,6 +214,9 @@ def main():
     trainer.train()
 
     print("Evaluating on test…")
+
+    trainer.args.predict_with_generate = True
+
     test_metrics = trainer.evaluate(tokenized["test"], metric_key_prefix="test")
     trainer.log(test_metrics)
 
